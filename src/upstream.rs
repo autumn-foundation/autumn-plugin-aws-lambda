@@ -14,7 +14,7 @@ pub struct Upstream(SocketAddr);
 impl Upstream {
     /// Makes an upstream from an address.
     ///
-    /// An unspecified IP (`0.0.0.0` or `::`) changes to loopback.
+    /// The function changes an unspecified IP (`0.0.0.0` or `::`) to loopback.
     #[must_use]
     pub const fn new(addr: SocketAddr) -> Self {
         let ip = match addr.ip() {
@@ -29,8 +29,12 @@ impl Upstream {
     ///
     /// # Errors
     ///
-    /// Returns an error when `unix_socket` or `tls` is set, when `port` is
-    /// `0`, or when `host` is not an IP address or `localhost`.
+    /// Returns an error in these conditions:
+    ///
+    /// - `unix_socket` is set.
+    /// - `tls` is set.
+    /// - `port` is `0`.
+    /// - `host` is not an IP address or `localhost`.
     pub fn from_server_config(server: &ServerConfig) -> Result<Self, PluginError> {
         if server.unix_socket.is_some() {
             return Err(PluginError::UnixSocketUnsupported);

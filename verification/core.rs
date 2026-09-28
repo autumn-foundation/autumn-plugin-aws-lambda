@@ -33,7 +33,7 @@ pub open spec fn spec_is_active(mode: Activation, runtime_api_present: bool) -> 
 pub fn is_active(mode: Activation, runtime_api_present: bool) -> (r: bool)
     ensures
         r == spec_is_active(mode, runtime_api_present),
-        // `Never` can never start the loop.
+        // `Never` does not start the loop.
         mode is Never ==> !r,
         // `Auto` never starts the loop outside Lambda.
         mode is Auto && !runtime_api_present ==> !r,
@@ -62,7 +62,7 @@ pub open spec fn spec_budget(deadline: u64, now: u64, margin: u64) -> int {
 pub fn invoke_budget_ms(deadline_ms: u64, now_ms: u64, margin_ms: u64) -> (r: u64)
     ensures
         r as int == spec_budget(deadline_ms, now_ms, margin_ms),
-        // The call never ends after the deadline minus the margin.
+        // The budget ends exactly at the deadline minus the margin.
         r > 0 ==> now_ms as int + r as int + margin_ms as int == deadline_ms as int,
         // No budget after the deadline.
         now_ms >= deadline_ms ==> r == 0,
@@ -102,17 +102,23 @@ pub fn next_delay_ms(current: u64, max: u64) -> (r: u64)
     }
 }
 
-/// Model of the readiness wait loop in `src/runtime.rs::wait_until`.
-/// It returns the number of probes. The last sleep stops at `timeout`.
-/// Proof: the loop ends, and the probe count has a fixed bound.
-pub fn readiness_probes(timeout: u64, initial: u64, max: u64) -> (probes: u64)
+/// Model of the readiness wait loop in `src/runtime.rs::wait_until`, for
+/// the case where `ready` stays false. It returns the number of probes and
+/// the total sleep time. The runtime normalizes `initial` and `max` so that
+/// the precondition is true. The runtime measures wall-clock time, which
+/// is not less than the sum of sleeps, so the runtime makes no more probes.
+/// Proof: the loop ends, the last sleep stops at `timeout`, and the probe
+/// count has a fixed bound.
+pub fn readiness_probes(timeout: u64, initial: u64, max: u64) -> (res: (u64, u64))
     requires
         0 < initial <= max,
-        // The probe counter exists only in this model. This keeps it in range.
+        // This precondition keeps the model counter in range.
         timeout < u64::MAX - 1,
     ensures
-        probes >= 1,
-        probes as int <= timeout as int / initial as int + 2,
+        res.0 >= 1,
+        res.0 as int <= timeout as int / initial as int + 2,
+        // The wait ends at the timeout, not later.
+        res.1 == timeout,
 {
     let mut slept: u64 = 0;
     let mut delay: u64 = initial;
@@ -132,7 +138,7 @@ pub fn readiness_probes(timeout: u64, initial: u64, max: u64) -> (probes: u64)
         let ghost t = timeout as int;
         let ghost init = initial as int;
         proof {
-            // Each earlier probe slept at least `initial`, and `slept < timeout`.
+            // Each earlier probe sleeps at least `initial`, and `slept < timeout`.
             assert(old_probes - 1 <= t / init) by (nonlinear_arith)
                 requires
                     (old_probes - 1) * init <= old_slept,
@@ -153,7 +159,7 @@ pub fn readiness_probes(timeout: u64, initial: u64, max: u64) -> (probes: u64)
         probes = probes + 1;
         proof {
             if slept < timeout {
-                // Not the last sleep, so the step was the full delay.
+                // This is not the last sleep. Thus the step is the full delay.
                 assert((probes as int - 1) * init <= slept as int) by (nonlinear_arith)
                     requires
                         (old_probes - 1) * init <= old_slept,
@@ -164,14 +170,15 @@ pub fn readiness_probes(timeout: u64, initial: u64, max: u64) -> (probes: u64)
             }
         }
     }
-    probes
+    (probes, slept)
 }
 
 // ---------------------------------------------------------------------------
 // Hop-by-hop filter (twin: `src/headers.rs::strip_hop_by_hop`)
 //
-// Header names are modeled as ids. `drop` is the fixed hop-by-hop list
-// plus the names in the `Connection` header.
+// The model uses integer IDs for header names. For responses, `drop` is
+// the fixed hop-by-hop list and the names in `Connection`. For requests,
+// `drop` is the fixed list and the forwarding headers.
 // ---------------------------------------------------------------------------
 
 /// Twin of the membership check on the drop list.
@@ -202,7 +209,7 @@ pub fn filter_headers(names: &Vec<u32>, drop: &Vec<u32>) -> (out: Vec<u32>)
         forall|k: int| 0 <= k < out.len() ==> !drop@.contains(#[trigger] out@[k]),
         // No new headers appear.
         forall|k: int| 0 <= k < out.len() ==> names@.contains(#[trigger] out@[k]),
-        // Liveness: every end-to-end header goes out.
+        // Completeness: every end-to-end header goes out.
         forall|k: int|
             0 <= k < names.len() && !drop@.contains(#[trigger] names@[k]) ==> out@.contains(
                 names@[k],
@@ -277,6 +284,184 @@ pub fn failure_status(f: ProxyFailure) -> (s: u16)
         ProxyFailure::Connect => 502,
         ProxyFailure::Timeout => 504,
         ProxyFailure::Body => 502,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Zero budget (twin: `src/proxy.rs::LambdaProxy::forward`)
+// ---------------------------------------------------------------------------
+
+/// Twin of the rule in `forward`: with no budget, do not call the upstream.
+pub fn calls_upstream(deadline_ms: u64, now_ms: u64, margin_ms: u64) -> (r: bool)
+    ensures
+        r <==> spec_budget(deadline_ms, now_ms, margin_ms) > 0,
+{
+    invoke_budget_ms(deadline_ms, now_ms, margin_ms) > 0
+}
+
+// ---------------------------------------------------------------------------
+// Path encoding (twin: `src/headers.rs::encode_path`)
+// ---------------------------------------------------------------------------
+
+/// RFC 3986 `pchar` and `/`, but not `%`.
+pub open spec fn is_path_byte(b: u8) -> bool {
+    (0x30 <= b <= 0x39) || (0x41 <= b <= 0x5a) || (0x61 <= b <= 0x7a) || b == 0x2d || b == 0x2e
+        || b == 0x5f || b == 0x7e || b == 0x21 || b == 0x24 || b == 0x26 || b == 0x27 || b
+        == 0x28 || b == 0x29 || b == 0x2a || b == 0x2b || b == 0x2c || b == 0x3b || b == 0x3d
+        || b == 0x3a || b == 0x40 || b == 0x2f
+}
+
+pub open spec fn is_hex(b: u8) -> bool {
+    (0x30 <= b <= 0x39) || (0x41 <= b <= 0x46) || (0x61 <= b <= 0x66)
+}
+
+/// Safety: each byte is a path byte or `%`, and each `%` starts a
+/// complete `%XX` escape. So `?`, `#`, space, CR, LF, and non-ASCII bytes
+/// cannot reach the request line.
+pub open spec fn safe_path(out: Seq<u8>) -> bool {
+    &&& forall|k: int| 0 <= k < out.len() ==> is_path_byte(#[trigger] out[k]) || out[k] == 0x25
+    &&& forall|k: int|
+        0 <= k < out.len() && #[trigger] out[k] == 0x25 ==> k + 2 < out.len() && is_hex(out[k + 1])
+            && is_hex(out[k + 2])
+}
+
+fn is_path_byte_exec(b: u8) -> (r: bool)
+    ensures
+        r == is_path_byte(b),
+{
+    (0x30 <= b && b <= 0x39) || (0x41 <= b && b <= 0x5a) || (0x61 <= b && b <= 0x7a) || b == 0x2d
+        || b == 0x2e || b == 0x5f || b == 0x7e || b == 0x21 || b == 0x24 || b == 0x26 || b == 0x27
+        || b == 0x28 || b == 0x29 || b == 0x2a || b == 0x2b || b == 0x2c || b == 0x3b || b == 0x3d
+        || b == 0x3a || b == 0x40 || b == 0x2f
+}
+
+fn is_hex_exec(b: u8) -> (r: bool)
+    ensures
+        r == is_hex(b),
+{
+    (0x30 <= b && b <= 0x39) || (0x41 <= b && b <= 0x46) || (0x61 <= b && b <= 0x66)
+}
+
+/// Twin of the `HEX` table lookup.
+fn hex_digit(n: u8) -> (r: u8)
+    requires
+        n < 16,
+    ensures
+        is_hex(r),
+        is_path_byte(r),
+{
+    if n < 10 {
+        0x30 + n
+    } else {
+        0x41 + (n - 10)
+    }
+}
+
+/// Twin of `encode_path`.
+pub fn encode_path(raw: &Vec<u8>) -> (out: Vec<u8>)
+    ensures
+        safe_path(out@),
+{
+    let mut out: Vec<u8> = Vec::new();
+    let mut i: usize = 0;
+    while i < raw.len()
+        invariant
+            0 <= i <= raw.len(),
+            safe_path(out@),
+        decreases raw.len() - i,
+    {
+        let b = raw[i];
+        let ghost old = out@;
+        if b == 0x25 && raw.len() - i > 2 && is_hex_exec(raw[i + 1]) && is_hex_exec(raw[i + 2]) {
+            out.push(b);
+            out.push(raw[i + 1]);
+            out.push(raw[i + 2]);
+            proof {
+                assert(out@ =~= old.push(b).push(raw@[i + 1]).push(raw@[i + 2]));
+                lemma_append_escape(old, b, raw@[i as int + 1], raw@[i as int + 2]);
+            }
+            i += 3;
+        } else if is_path_byte_exec(b) {
+            out.push(b);
+            proof {
+                assert(out@ =~= old.push(b));
+                lemma_append_path_byte(old, b);
+            }
+            i += 1;
+        } else {
+            let hi = hex_digit(b / 16);
+            let lo = hex_digit(b % 16);
+            out.push(0x25);
+            out.push(hi);
+            out.push(lo);
+            proof {
+                assert(out@ =~= old.push(0x25).push(hi).push(lo));
+                lemma_append_escape(old, 0x25, hi, lo);
+            }
+            i += 1;
+        }
+    }
+    out
+}
+
+proof fn lemma_append_path_byte(s: Seq<u8>, b: u8)
+    requires
+        safe_path(s),
+        is_path_byte(b),
+    ensures
+        safe_path(s.push(b)),
+{
+    let t = s.push(b);
+    assert forall|k: int| 0 <= k < t.len() implies is_path_byte(#[trigger] t[k]) || t[k] == 0x25 by {
+        if k < s.len() {
+            assert(t[k] == s[k]);
+        }
+    }
+    assert forall|k: int|
+        0 <= k < t.len() && #[trigger] t[k] == 0x25 implies k + 2 < t.len() && is_hex(t[k + 1])
+        && is_hex(t[k + 2]) by {
+        if k < s.len() {
+            assert(t[k] == s[k]);
+            assert(s[k] == 0x25);
+            assert(t[k + 1] == s[k + 1]);
+            assert(t[k + 2] == s[k + 2]);
+        } else {
+            assert(t[k] == b);
+            assert(!is_path_byte(0x25));
+        }
+    }
+}
+
+proof fn lemma_append_escape(s: Seq<u8>, p: u8, h1: u8, h2: u8)
+    requires
+        safe_path(s),
+        p == 0x25,
+        is_hex(h1),
+        is_hex(h2),
+    ensures
+        safe_path(s.push(p).push(h1).push(h2)),
+{
+    let t = s.push(p).push(h1).push(h2);
+    let n = s.len() as int;
+    assert(t[n] == p && t[n + 1] == h1 && t[n + 2] == h2);
+    assert forall|k: int| 0 <= k < t.len() implies is_path_byte(#[trigger] t[k]) || t[k] == 0x25 by {
+        if k < n {
+            assert(t[k] == s[k]);
+        }
+    }
+    assert forall|k: int|
+        0 <= k < t.len() && #[trigger] t[k] == 0x25 implies k + 2 < t.len() && is_hex(t[k + 1])
+        && is_hex(t[k + 2]) by {
+        if k < n {
+            assert(t[k] == s[k]);
+            assert(s[k] == 0x25);
+            assert(t[k + 1] == s[k + 1]);
+            assert(t[k + 2] == s[k + 2]);
+        } else if k == n {
+        } else {
+            // Hex digits are not `%`.
+            assert(k == n + 1 || k == n + 2);
+        }
     }
 }
 

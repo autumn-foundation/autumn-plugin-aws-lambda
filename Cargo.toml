@@ -9,7 +9,7 @@ repository = "https://github.com/autumn-foundation/autumn-plugin-aws-lambda"
 readme = "README.md"
 keywords = ["autumn", "aws", "lambda", "serverless", "plugin"]
 categories = ["web-programming::http-server"]
-exclude = ["verification/", ".github/"]
+exclude = ["verification/", ".github/", ".githooks/", "CLAUDE.md", ".gitignore"]
 
 [dependencies]
 autumn-web = { version = "0.7", default-features = false }
@@ -35,8 +35,11 @@ tokio = { version = "1", features = ["full"] }
 [lints.rust]
 unsafe_code = "forbid"
 missing_docs = "warn"
+unreachable_pub = "warn"
 
 [lints.clippy]
 pedantic = { level = "warn", priority = -1 }
 nursery = { level = "warn", priority = -1 }
 unwrap_used = "warn"
+# Conflicts with rustc `unreachable_pub`, which this crate uses instead.
+redundant_pub_crate = "allow"

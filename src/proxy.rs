@@ -1,4 +1,5 @@
-//! The proxy service: Lambda request in, upstream response out.
+//! The proxy service. It sends a Lambda request to the upstream and
+//! returns the response.
 
 use std::convert::Infallible;
 use std::future::Future;
@@ -7,30 +8,39 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use bytes::Bytes;
-use http::uri::PathAndQuery;
-use http::{HeaderValue, Request, Response, StatusCode, Uri, Version, header};
+use http::{HeaderValue, Request, Response, StatusCode, Version, header};
 use http_body_util::combinators::BoxBody;
-use http_body_util::{BodyExt, Full};
+use http_body_util::{BodyExt, Full, Limited};
 use hyper_util::client::legacy::Client;
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::rt::TokioExecutor;
 use lambda_http::RequestExt;
+use lambda_http::request::RequestContext;
 
-use crate::Upstream;
-use crate::headers::{prepare_request_headers, strip_hop_by_hop};
+use crate::ResponseMode;
+use crate::headers::{
+    fold_repeated_headers, prepare_request_headers, set_forwarded_for, strip_hop_by_hop,
+    text_body_is_lossless, upstream_path_and_query,
+};
 use crate::timing::budget_until;
+use crate::upstream::Upstream;
 
 /// The response body type of [`LambdaProxy`].
 pub type ProxyBody = BoxBody<Bytes, hyper::Error>;
 
+/// The largest body that buffered mode reads. Lambda does not accept a
+/// larger buffered response.
+const MAX_BUFFERED_BODY: usize = 6 * 1024 * 1024;
+
 /// Why the upstream call failed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ProxyFailure {
-    /// The client could not connect or send the request.
+    /// The client cannot connect or cannot send the request.
     Connect,
-    /// The call did not finish before the invocation deadline.
+    /// The call does not end before the invocation deadline.
     Timeout,
-    /// The response body could not be read.
+    /// The proxy cannot read the response body, or the body is too large.
     Body,
 }
 
@@ -60,65 +70,79 @@ impl ProxyFailure {
 
 /// A `tower` service that sends Lambda HTTP requests to the upstream.
 ///
-/// It never returns an error. Upstream failures become `502` or `504`
-/// responses.
+/// Upstream failures before the response head become `502` or `504`
+/// responses. The service does not return an error.
 #[derive(Debug, Clone)]
 pub struct LambdaProxy {
     client: Client<HttpConnector, Full<Bytes>>,
     upstream: Upstream,
     timeout_margin: Duration,
-    buffer_body: bool,
+    mode: ResponseMode,
 }
 
 impl LambdaProxy {
-    /// Makes a proxy to `upstream`.
+    /// Makes a proxy to `upstream`. The timeout margin is zero. The mode is
+    /// [`ResponseMode::Buffered`].
     #[must_use]
     pub fn new(upstream: Upstream) -> Self {
         Self {
             client: Client::builder(TokioExecutor::new()).build_http(),
             upstream,
             timeout_margin: Duration::ZERO,
-            buffer_body: true,
+            mode: ResponseMode::Buffered,
         }
     }
 
-    /// Sets the time to keep free before the invocation deadline.
+    /// Sets the time between the end of the upstream call and the
+    /// invocation deadline.
     #[must_use]
     pub const fn timeout_margin(mut self, margin: Duration) -> Self {
         self.timeout_margin = margin;
         self
     }
 
-    /// When `true`, reads the full body before it returns. The deadline
-    /// then also applies to the body. When `false`, streams the body.
+    /// Sets the response mode.
+    ///
+    /// - `Buffered`: the proxy reads the full body (up to 6 MiB) before it
+    ///   returns. The deadline applies to the body too.
+    /// - `Streaming`: the proxy returns after the head. The deadline
+    ///   applies to the head only. A body error then ends the stream.
     #[must_use]
-    pub const fn buffer_body(mut self, buffer: bool) -> Self {
-        self.buffer_body = buffer;
+    pub const fn response_mode(mut self, mode: ResponseMode) -> Self {
+        self.mode = mode;
         self
     }
 
-    /// Sends one request. The deadline, if known, applies to the whole call.
+    /// Sends one request. The deadline, if known, applies to the call.
     async fn forward(self, req: lambda_http::Request) -> Result<Response<ProxyBody>, ProxyFailure> {
         let context = req.lambda_context_ref();
         let deadline = context.map(|c| c.deadline);
         let request_id = context.map(|c| c.request_id.clone());
+        let source_ip = source_ip(&req);
+        let raw_path = Some(req.raw_http_path()).filter(|p| !p.is_empty());
+        let path = upstream_path_and_query(raw_path, req.uri());
 
         let (mut parts, body) = req.into_parts();
-        parts.uri = self.upstream_uri(parts.uri.path_and_query())?;
+        parts.uri = format!("http://{}{path}", self.upstream.addr())
+            .parse()
+            .map_err(|_| ProxyFailure::Connect)?;
         parts.version = Version::HTTP_11;
         parts.extensions = http::Extensions::new();
         prepare_request_headers(&mut parts.headers, request_id.as_deref());
+        set_forwarded_for(&mut parts.headers, source_ip.as_deref());
         let upstream_req = Request::from_parts(parts, Full::new(body_bytes(body)));
 
-        let call = self.send(upstream_req);
-        match deadline {
-            Some(deadline) => {
-                tokio::time::timeout(budget_until(deadline, self.timeout_margin), call)
-                    .await
-                    .map_err(|_| ProxyFailure::Timeout)?
-            }
-            None => call.await,
+        let Some(deadline) = deadline else {
+            return self.send(upstream_req).await;
+        };
+        let budget = budget_until(deadline, self.timeout_margin);
+        if budget.is_zero() {
+            // No time is left. Do not call the upstream.
+            return Err(ProxyFailure::Timeout);
         }
+        tokio::time::timeout(budget, self.send(upstream_req))
+            .await
+            .map_err(|_| ProxyFailure::Timeout)?
     }
 
     async fn send(&self, req: Request<Full<Bytes>>) -> Result<Response<ProxyBody>, ProxyFailure> {
@@ -128,29 +152,38 @@ impl LambdaProxy {
         })?;
         let (mut parts, body) = resp.into_parts();
         strip_hop_by_hop(&mut parts.headers);
-        let body = if self.buffer_body {
-            let bytes = body
-                .collect()
-                .await
-                .map_err(|error| {
-                    tracing::warn!(upstream = %self.upstream, %error, "upstream body failed");
-                    ProxyFailure::Body
-                })?
-                .to_bytes();
-            full(bytes)
-        } else {
-            body.boxed()
+        fold_repeated_headers(&mut parts.headers);
+        let body = match self.mode {
+            ResponseMode::Streaming => body.boxed(),
+            ResponseMode::Buffered => {
+                let bytes = Limited::new(body, MAX_BUFFERED_BODY)
+                    .collect()
+                    .await
+                    .map_err(|error| {
+                        tracing::warn!(upstream = %self.upstream, %error, "upstream body failed");
+                        ProxyFailure::Body
+                    })?
+                    .to_bytes();
+                // The length can change when lambda_http encodes the body.
+                parts.headers.remove(header::CONTENT_LENGTH);
+                let content_type = parts
+                    .headers
+                    .get(header::CONTENT_TYPE)
+                    .and_then(|v| v.to_str().ok());
+                if !parts.headers.contains_key(header::CONTENT_ENCODING)
+                    && !text_body_is_lossless(content_type, &bytes)
+                {
+                    // lambda_http sends a body with any content-encoding as
+                    // base64 binary, with no charset change.
+                    parts.headers.insert(
+                        header::CONTENT_ENCODING,
+                        HeaderValue::from_static("identity"),
+                    );
+                }
+                full(bytes)
+            }
         };
         Ok(Response::from_parts(parts, body))
-    }
-
-    fn upstream_uri(&self, path: Option<&PathAndQuery>) -> Result<Uri, ProxyFailure> {
-        Uri::builder()
-            .scheme("http")
-            .authority(self.upstream.addr().to_string())
-            .path_and_query(path.map_or("/", PathAndQuery::as_str))
-            .build()
-            .map_err(|_| ProxyFailure::Connect)
     }
 }
 
@@ -171,6 +204,16 @@ impl tower_service::Service<lambda_http::Request> for LambdaProxy {
                 .await
                 .unwrap_or_else(ProxyFailure::response))
         })
+    }
+}
+
+/// Returns the client IP from the API Gateway request context.
+fn source_ip(req: &lambda_http::Request) -> Option<String> {
+    match req.request_context_ref()? {
+        RequestContext::ApiGatewayV1(ctx) => ctx.identity.source_ip.clone(),
+        RequestContext::ApiGatewayV2(ctx) => ctx.http.source_ip.clone(),
+        RequestContext::WebSocket(ctx) => ctx.identity.source_ip.clone(),
+        _ => None,
     }
 }
 

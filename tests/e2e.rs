@@ -2,9 +2,9 @@
 //! process, and a fake Lambda Runtime API in this process.
 
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path as FsPath, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use axum::Router;
@@ -117,20 +117,37 @@ async fn spawn_fake() -> (
     (addr, event_tx, posted_rx)
 }
 
-/// Builds the example and returns its path.
-fn example_binary() -> PathBuf {
+/// Returns `(target dir, profile dir)` of this test binary.
+fn dirs() -> (PathBuf, PathBuf) {
     // current_exe: <target>/<profile>/deps/e2e-<hash>
     let exe = std::env::current_exe().expect("exe");
-    let profile_dir = exe.parent().and_then(|p| p.parent()).expect("profile dir");
-    let target_dir = profile_dir.parent().expect("target dir");
-    let status = Command::new(env!("CARGO"))
-        .args(["build", "--quiet", "--example", "hello", "--target-dir"])
-        .arg(target_dir)
-        .current_dir(env!("CARGO_MANIFEST_DIR"))
-        .status()
-        .expect("cargo build");
-    assert!(status.success(), "example build failed");
-    profile_dir.join("examples").join("hello")
+    let profile_dir = exe
+        .parent()
+        .and_then(|p| p.parent())
+        .expect("profile dir")
+        .to_path_buf();
+    let target_dir = profile_dir.parent().expect("target dir").to_path_buf();
+    (target_dir, profile_dir)
+}
+
+/// Builds the example one time, with the profile of this test binary.
+fn example_binary() -> &'static FsPath {
+    static BINARY: OnceLock<PathBuf> = OnceLock::new();
+    BINARY.get_or_init(|| {
+        let (target_dir, profile_dir) = dirs();
+        let mut cmd = Command::new(env!("CARGO"));
+        cmd.args(["build", "--quiet", "--example", "hello", "--target-dir"])
+            .arg(&target_dir)
+            .current_dir(env!("CARGO_MANIFEST_DIR"));
+        if profile_dir.file_name().is_some_and(|n| n == "release") {
+            cmd.arg("--release");
+        }
+        assert!(
+            cmd.status().expect("cargo build").success(),
+            "example build failed"
+        );
+        profile_dir.join("examples").join("hello")
+    })
 }
 
 fn free_port() -> u16 {
@@ -141,14 +158,17 @@ fn free_port() -> u16 {
         .port()
 }
 
-/// Stops the child process on drop: SIGTERM first, then kill.
-struct App(Child);
+/// A child app process. Drop stops it: SIGTERM first, then kill.
+struct App {
+    child: Child,
+    log: PathBuf,
+}
 
 impl App {
     /// Sends SIGTERM, like Lambda at shutdown.
     fn terminate(&self) {
         let _ = Command::new("kill")
-            .args(["-TERM", &self.0.id().to_string()])
+            .args(["-TERM", &self.child.id().to_string()])
             .stderr(Stdio::null())
             .status();
     }
@@ -157,24 +177,29 @@ impl App {
     fn wait_exit(&mut self, limit: Duration) -> Option<std::process::ExitStatus> {
         let end = std::time::Instant::now() + limit;
         while std::time::Instant::now() < end {
-            if let Ok(Some(status)) = self.0.try_wait() {
+            if let Ok(Some(status)) = self.child.try_wait() {
                 return Some(status);
             }
             std::thread::sleep(Duration::from_millis(20));
         }
         None
     }
+
+    /// Returns the output of the app (stdout and stderr).
+    fn log(&self) -> String {
+        std::fs::read_to_string(&self.log).unwrap_or_default()
+    }
 }
 
 impl Drop for App {
     fn drop(&mut self) {
-        if matches!(self.0.try_wait(), Ok(Some(_))) {
+        if matches!(self.child.try_wait(), Ok(Some(_))) {
             return;
         }
         self.terminate();
         if self.wait_exit(Duration::from_secs(10)).is_none() {
-            let _ = self.0.kill();
-            let _ = self.0.wait();
+            let _ = self.child.kill();
+            let _ = self.child.wait();
         }
     }
 }
@@ -182,33 +207,80 @@ impl Drop for App {
 /// Autumn checks the `Host` header. Lambda URLs must be trusted.
 const TRUSTED_HOSTS: &str = "localhost,.lambda-url.us-east-1.on.aws";
 
-fn spawn_app(runtime_api: Option<SocketAddr>, port: u16, mode: &str) -> App {
-    spawn_app_with_hosts(runtime_api, port, mode, TRUSTED_HOSTS)
+/// Options for one child app.
+struct Opts<'a> {
+    runtime_api: Option<SocketAddr>,
+    mode: &'a str,
+    hosts: &'a str,
+    concurrency: Option<u32>,
 }
 
-fn spawn_app_with_hosts(
-    runtime_api: Option<SocketAddr>,
-    port: u16,
-    mode: &str,
-    hosts: &str,
-) -> App {
+impl Default for Opts<'_> {
+    fn default() -> Self {
+        Self {
+            runtime_api: None,
+            mode: "buffered",
+            hosts: TRUSTED_HOSTS,
+            concurrency: None,
+        }
+    }
+}
+
+fn spawn_app(runtime_api: Option<SocketAddr>, port: u16, mode: &str) -> App {
+    spawn_with(
+        port,
+        &Opts {
+            runtime_api,
+            mode,
+            ..Opts::default()
+        },
+    )
+}
+
+/// Starts the example with a clean environment. Output goes to a log file.
+fn spawn_with(port: u16, opts: &Opts<'_>) -> App {
+    let (target_dir, _) = dirs();
+    let log_dir = target_dir.join("e2e-logs");
+    std::fs::create_dir_all(&log_dir).expect("log dir");
+    let log = log_dir.join(format!("app-{port}.log"));
+    let out = std::fs::File::create(&log).expect("log file");
+    let err = out.try_clone().expect("log file");
+
     let mut cmd = Command::new(example_binary());
-    cmd.env("AUTUMN_SERVER__PORT", port.to_string())
-        .env("AUTUMN_SECURITY__TRUSTED_HOSTS__HOSTS", hosts)
-        .env("LAMBDA_RESPONSE_MODE", mode)
+    cmd.env_clear()
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        .env("AUTUMN_LOG__LEVEL", "error")
+        .env("AUTUMN_SERVER__PORT", port.to_string())
+        .env("AUTUMN_SECURITY__TRUSTED_HOSTS__HOSTS", opts.hosts)
+        .env("AUTUMN_SERVER__PRESTOP_GRACE_SECS", "0")
+        .env("AUTUMN_SERVER__SHUTDOWN_TIMEOUT_SECS", "1")
+        .env("LAMBDA_RESPONSE_MODE", opts.mode)
         .env("AWS_LAMBDA_FUNCTION_NAME", "hello")
         .env("AWS_LAMBDA_FUNCTION_MEMORY_SIZE", "128")
         .env("AWS_LAMBDA_FUNCTION_VERSION", "$LATEST")
-        .env("AUTUMN_SERVER__PRESTOP_GRACE_SECS", "0")
-        .env("AUTUMN_SERVER__SHUTDOWN_TIMEOUT_SECS", "2")
-        .env_remove("AWS_LAMBDA_RUNTIME_API")
-        .env_remove("AWS_LAMBDA_MAX_CONCURRENCY")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    if let Some(api) = runtime_api {
+        .current_dir(&log_dir)
+        .stdout(out)
+        .stderr(err);
+    // Keep coverage data from the child under `cargo llvm-cov`.
+    if let Some(profile) = std::env::var_os("LLVM_PROFILE_FILE") {
+        cmd.env("LLVM_PROFILE_FILE", profile);
+    }
+    if let Some(api) = opts.runtime_api {
         cmd.env("AWS_LAMBDA_RUNTIME_API", api.to_string());
     }
-    App(cmd.spawn().expect("spawn example"))
+    if let Some(n) = opts.concurrency {
+        cmd.env("AWS_LAMBDA_MAX_CONCURRENCY", n.to_string());
+    }
+    App {
+        child: cmd.spawn().expect("spawn example"),
+        log,
+    }
+}
+
+/// Returns an address with no listener: `/next` fails there.
+fn closed_addr() -> SocketAddr {
+    let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    l.local_addr().expect("addr")
 }
 
 fn event(path: &str) -> String {
@@ -306,7 +378,14 @@ async fn streaming_invocation_reaches_the_app() {
 #[tokio::test]
 async fn untrusted_host_is_a_400_response_not_an_invocation_error() {
     let (api, events, mut posted) = spawn_fake().await;
-    let _app = spawn_app_with_hosts(Some(api), free_port(), "buffered", "localhost");
+    let _app = spawn_with(
+        free_port(),
+        &Opts {
+            runtime_api: Some(api),
+            hosts: "localhost",
+            ..Opts::default()
+        },
+    );
 
     let got = invoke(&events, &mut posted, "e2e-h", "/hello").await;
     assert_eq!(got.kind, "response");
@@ -338,17 +417,66 @@ async fn sigterm_stops_the_app_cleanly_while_the_loop_waits() {
 
 #[tokio::test]
 async fn runtime_api_failure_exits_with_code_1() {
-    // A closed port: `/next` fails, so the loop stops.
-    let closed = {
-        let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
-        l.local_addr().expect("addr")
-    };
-    let mut app = spawn_app(Some(closed), free_port(), "buffered");
-    let status = tokio::task::spawn_blocking(move || app.wait_exit(WAIT))
-        .await
-        .expect("join")
-        .expect("exit in time");
-    assert_eq!(status.code(), Some(1), "{status}");
+    let mut app = spawn_app(Some(closed_addr()), free_port(), "buffered");
+    let status = tokio::task::spawn_blocking(move || {
+        let status = app.wait_exit(WAIT);
+        (status, app.log())
+    })
+    .await
+    .expect("join");
+    let (status, log) = status;
+    assert_eq!(status.and_then(|s| s.code()), Some(1), "{log}");
+    assert!(log.contains("AWS Lambda runtime loop stopped"), "{log}");
+}
+
+#[tokio::test]
+async fn concurrent_mode_serves_events() {
+    let (api, events, mut posted) = spawn_fake().await;
+    let _app = spawn_with(
+        free_port(),
+        &Opts {
+            runtime_api: Some(api),
+            concurrency: Some(2),
+            ..Opts::default()
+        },
+    );
+    for id in ["c-1", "c-2", "c-3"] {
+        let got = invoke(&events, &mut posted, id, "/hello").await;
+        assert_eq!(
+            json_body(&got)["body"],
+            format!("hello from autumn (request {id})")
+        );
+    }
+}
+
+#[tokio::test]
+async fn concurrent_mode_exits_when_the_runtime_api_is_gone() {
+    // lambda_runtime retries `/next` with no end in concurrent mode.
+    // The plugin watchdog must stop the process.
+    let mut app = spawn_with(
+        free_port(),
+        &Opts {
+            runtime_api: Some(closed_addr()),
+            concurrency: Some(4),
+            ..Opts::default()
+        },
+    );
+    let (status, log) = tokio::task::spawn_blocking(move || {
+        let status = app.wait_exit(WAIT);
+        (status, app.log())
+    })
+    .await
+    .expect("join");
+    let tail: String = log
+        .chars()
+        .rev()
+        .take(2000)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    assert_eq!(status.and_then(|s| s.code()), Some(1), "{tail}");
+    assert!(log.contains("Runtime API is not reachable"), "{tail}");
 }
 
 #[tokio::test]

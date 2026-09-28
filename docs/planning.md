@@ -33,17 +33,17 @@ Possible designs:
    `run()` does not expose the router, so this needs a change in
    `autumn-web`.
 3. **Test router.** Use `autumn_web::test::TestApp::into_router()`.
-   This skips production wiring (config, database, middleware).
+   This does not use the production setup (config, database, middleware).
 4. **Unix socket proxy.** Same as (1), but on a Unix socket.
-5. **Lambda Web Adapter.** Use the AWS layer. This needs no code, but
-   the app has no Lambda context (request ID, deadline).
+5. **Lambda Web Adapter.** Use the AWS layer. This needs no code. But it
+   is a separate process, and it does not know the Autumn startup state.
 
 Feature ideas:
 
 - Detect Lambda from `AWS_LAMBDA_RUNTIME_API` (mode `Auto`).
 - Support buffered and streaming responses.
 - Use the invocation deadline as the upstream timeout.
-- Send the Lambda request ID as `x-request-id`.
+- Send the Lambda request ID to the app.
 - Remove hop-by-hop headers in both directions.
 - Wait until the app is ready before the first event.
 - Support Lambda Managed Instances (concurrent invocations).
@@ -60,11 +60,14 @@ Question: "How can we make this plugin fail?" Each answer gives a guard.
 | Send `transfer-encoding: chunked` to API Gateway. | Remove hop-by-hop headers from the response. |
 | Send a wrong `content-length` after base64 decode. | Remove `content-length`. The client sets it again from the body. |
 | Block the startup hook. Other hooks never run. | Spawn the loop. Return from the hook immediately. |
-| Let the upstream call run past the Lambda deadline. | Use `deadline - now - margin` as the timeout. Return `504`. |
+| Let the upstream call run past the Lambda deadline. | Use `deadline - now - margin` as the timeout. Return `504`. With no time left, do not call. |
 | Return a Lambda error when the app is down. Async callers retry. | Return a `502` HTTP response. |
 | Lose the `Host` header. `trusted_hosts` rejects the request. | Keep the original `Host` header. |
-| Change the client IP. | Keep `x-forwarded-for` from AWS. Tell users to trust loopback. |
-| The runtime loop stops. The process stays alive and gets no events. | Log the error. Exit with code 1. Lambda starts a new environment. |
+| Change the client IP. | Set `x-forwarded-for` to the IP that AWS saw. Remove `x-forwarded-host`, `x-real-ip`, `forwarded`. |
+| Delete `Host` with a `Connection` header. | On requests, remove only the fixed hop-by-hop list. |
+| Send `/a/%2e%2e/admin` to reach `/admin`. | Send the raw event path. Do not remove dot segments. |
+| Lose repeated response headers. | Join repeated headers, except `Set-Cookie`. |
+| The runtime loop stops. The process stays alive and gets no events. | Log the error. Exit with code 1. Lambda starts a new environment. In concurrent mode, check the Runtime API every second. |
 | Register the plugin twice. Two loops poll for events. | The default `Plugin::name` makes the second call a no-op. |
 
 ## 3. Six thinking hats
@@ -83,9 +86,10 @@ profile of Autumn has strict checks (signing secret, trusted hosts) that
 can fail on cold start. Graceful shutdown on Lambda has little time.
 
 **Yellow hat (benefits).** No fork of `autumn-web`. All Autumn middleware
-and config stay active. The same binary runs local and on Lambda. The
-pure parts (activation, address, headers, budget) are easy to test and
-to prove.
+and config stay active. The same binary runs on a local computer and on
+Lambda. The
+pure parts (activation, address, headers, path, budget) are easy to test
+and to prove.
 
 **Green hat (ideas).** Streaming mode for Function URLs. Concurrent mode
 for Managed Instances. Later: Unix socket upstream when `autumn-web`
@@ -93,8 +97,8 @@ gives a router hook.
 
 **Blue hat (process).** Decision: design (1), loopback proxy.
 Order of work: Verus spec and proof for the pure core, then failing
-tests (RED), then code (GREEN), then refactor. Then review with agents
-from different angles and fix the findings.
+tests (RED), then code (GREEN), then refactor. Then agents review the
+code for different concerns, and we fix the findings.
 
 ## Decision
 
@@ -109,7 +113,7 @@ In scope:
 - `Activation`: `Auto`, `Always`, `Never`.
 - `ResponseMode`: `Buffered`, `Streaming`.
 - Upstream from Autumn `server.host` and `server.port`, or an override.
-- Readiness wait, deadline timeout, header rules, request ID.
+- Readiness wait, deadline timeout, header and path rules, request ID.
 - Verus proofs for the pure core.
 - Unit, property, integration, and end-to-end tests.
 
@@ -117,3 +121,10 @@ Out of scope:
 
 - Unix socket and TLS upstreams (clear error at startup).
 - Non-HTTP Lambda events (SQS, S3, and so on).
+
+## Review
+
+After REFACTOR, five agents reviewed the code: correctness, security,
+lifecycle, API and docs, and tests and proofs. The fixes are in the
+"Reverse brainstorming" table above. The review also added Verus proofs
+for path encoding and the zero-budget rule.

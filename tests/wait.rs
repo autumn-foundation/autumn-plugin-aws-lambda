@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
-use autumn_plugin_aws_lambda::wait_until;
+use autumn_plugin_aws_lambda::__private::wait_until;
 
 const MS: Duration = Duration::from_millis(1);
 
@@ -57,10 +57,10 @@ async fn returns_false_after_timeout_with_bounded_probes() {
     )
     .await;
     assert!(!ready);
-    // Verus bound: probes <= timeout / initial + 2.
-    assert!(calls.load(Ordering::SeqCst) <= 1000 / 10 + 2);
-    assert!(start.elapsed() >= MS * 1000);
-    assert!(start.elapsed() <= MS * 1100);
+    // Probes at 0, 10, 30, 70, 150, 250, ..., 950, and 1000 ms: backoff
+    // doubles to 100 ms, and the last sleep stops at the timeout.
+    assert_eq!(calls.load(Ordering::SeqCst), 14);
+    assert_eq!(start.elapsed(), MS * 1000);
 }
 
 #[tokio::test(start_paused = true)]

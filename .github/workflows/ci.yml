@@ -33,6 +33,16 @@ jobs:
       - name: Test and coverage (minimum 85% lines)
         run: cargo llvm-cov --fail-under-lines 85 --summary-only
 
+  msrv:
+    name: MSRV (1.88)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88.0
+      - uses: Swatinem/rust-cache@v2
+      - name: Check
+        run: cargo check --all-targets
+
   verus:
     name: Verus proofs
     runs-on: ubuntu-24.04

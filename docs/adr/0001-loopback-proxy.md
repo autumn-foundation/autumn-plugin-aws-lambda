@@ -7,13 +7,14 @@
 
 `autumn_web::AppBuilder::run()` builds the router, binds the listener,
 and serves requests. It does not give the router to other code. A plugin
-can only add hooks. `run()` binds the listener before it runs startup
-hooks.
+cannot get the built router. `run()` binds the listener before it runs
+startup hooks.
 
 ## Decision
 
-The plugin adds one startup hook. When Lambda is detected, the hook
-spawns a task. The task:
+The plugin adds one startup hook. When the plugin finds Lambda, the hook
+starts a thread with its own Tokio runtime. The `lambda_http` loop future
+is not `Send`, so it cannot run in a Tokio task. The thread:
 
 1. Waits until Autumn sets "startup complete".
 2. Starts the `lambda_http` runtime loop.
@@ -45,11 +46,12 @@ Bad:
 
 - Each request uses a loopback TCP connection. The client keeps
   connections open, so the cost is small.
-- Unix socket and TLS listeners are not supported. The plugin stops
-  with a clear error.
+- The plugin does not support Unix socket or TLS listeners. It stops at
+  startup with an error.
 
 ## Alternatives
 
 - In-process router: needs a new `autumn-web` API.
-- `TestApp::into_router()`: skips production wiring.
-- AWS Lambda Web Adapter: no access to the Lambda context.
+- `TestApp::into_router()`: it does not use the production setup.
+- AWS Lambda Web Adapter: it is a separate layer and process. It does
+  not know the Autumn startup state or config.
