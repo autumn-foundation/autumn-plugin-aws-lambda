@@ -2,8 +2,15 @@
 
 use std::time::Duration;
 
-use crate::LambdaProxy;
 use crate::timing::{as_ms, next_delay_ms};
+use crate::{LambdaProxy, PluginError};
+
+/// First delay of the readiness wait.
+const READY_INITIAL: Duration = Duration::from_millis(5);
+/// Longest delay of the readiness wait.
+const READY_MAX: Duration = Duration::from_millis(100);
+/// Name of the runtime loop thread.
+const THREAD_NAME: &str = "aws-lambda-runtime";
 
 /// How the plugin returns responses to Lambda.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -57,4 +64,48 @@ pub async fn run(proxy: LambdaProxy, mode: ResponseMode) -> Result<(), lambda_ht
             lambda_http::run_with_streaming_response_concurrent(proxy.buffer_body(false)).await
         }
     }
+}
+
+/// Starts the runtime loop on a new thread.
+///
+/// The thread waits for `is_ready` (up to `readiness_timeout`), then runs
+/// the loop. The `lambda_http` loop future is not `Send`, so it cannot go
+/// to `tokio::spawn`. It gets its own thread and current-thread runtime.
+///
+/// The loop runs forever. If it stops or panics, the process exits with
+/// code 1, and Lambda starts a new execution environment.
+///
+/// # Errors
+///
+/// Returns an error when the runtime or the thread cannot start.
+pub fn spawn_loop(
+    proxy: LambdaProxy,
+    mode: ResponseMode,
+    readiness_timeout: Duration,
+    is_ready: impl Fn() -> bool + Send + 'static,
+) -> Result<(), PluginError> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(PluginError::Runtime)?;
+    std::thread::Builder::new()
+        .name(THREAD_NAME.to_owned())
+        .spawn(move || {
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                runtime.block_on(async move {
+                    if !wait_until(is_ready, readiness_timeout, READY_INITIAL, READY_MAX).await {
+                        tracing::warn!(
+                            ?readiness_timeout,
+                            "Autumn startup not complete; starting Lambda loop anyway"
+                        );
+                    }
+                    tracing::info!(?mode, "starting AWS Lambda runtime loop");
+                    run(proxy, mode).await
+                })
+            }));
+            tracing::error!(?outcome, "AWS Lambda runtime loop stopped; exiting");
+            std::process::exit(1);
+        })
+        .map_err(PluginError::Runtime)?;
+    Ok(())
 }

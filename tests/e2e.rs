@@ -141,13 +141,41 @@ fn free_port() -> u16 {
         .port()
 }
 
-/// Kills the child process on drop.
+/// Stops the child process on drop: SIGTERM first, then kill.
 struct App(Child);
+
+impl App {
+    /// Sends SIGTERM, like Lambda at shutdown.
+    fn terminate(&self) {
+        let _ = Command::new("kill")
+            .args(["-TERM", &self.0.id().to_string()])
+            .stderr(Stdio::null())
+            .status();
+    }
+
+    /// Waits for exit. Returns `None` on timeout.
+    fn wait_exit(&mut self, limit: Duration) -> Option<std::process::ExitStatus> {
+        let end = std::time::Instant::now() + limit;
+        while std::time::Instant::now() < end {
+            if let Ok(Some(status)) = self.0.try_wait() {
+                return Some(status);
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        None
+    }
+}
 
 impl Drop for App {
     fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
+        if matches!(self.0.try_wait(), Ok(Some(_))) {
+            return;
+        }
+        self.terminate();
+        if self.wait_exit(Duration::from_secs(10)).is_none() {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
     }
 }
 
@@ -171,6 +199,8 @@ fn spawn_app_with_hosts(
         .env("AWS_LAMBDA_FUNCTION_NAME", "hello")
         .env("AWS_LAMBDA_FUNCTION_MEMORY_SIZE", "128")
         .env("AWS_LAMBDA_FUNCTION_VERSION", "$LATEST")
+        .env("AUTUMN_SERVER__PRESTOP_GRACE_SECS", "0")
+        .env("AUTUMN_SERVER__SHUTDOWN_TIMEOUT_SECS", "2")
         .env_remove("AWS_LAMBDA_RUNTIME_API")
         .env_remove("AWS_LAMBDA_MAX_CONCURRENCY")
         .stdout(Stdio::null())
@@ -287,6 +317,38 @@ async fn untrusted_host_is_a_400_response_not_an_invocation_error() {
             .as_str()
             .is_some_and(|b| b.contains("Invalid Host header"))
     );
+}
+
+#[tokio::test]
+async fn sigterm_stops_the_app_cleanly_while_the_loop_waits() {
+    let (api, events, mut posted) = spawn_fake().await;
+    let mut app = spawn_app(Some(api), free_port(), "buffered");
+
+    // One event proves the loop runs. Then the loop waits on `/next`.
+    let got = invoke(&events, &mut posted, "e2e-t", "/hello").await;
+    assert_eq!(json_body(&got)["statusCode"], 200);
+
+    app.terminate();
+    let status = tokio::task::spawn_blocking(move || app.wait_exit(WAIT))
+        .await
+        .expect("join")
+        .expect("exit in time");
+    assert!(status.success(), "{status}");
+}
+
+#[tokio::test]
+async fn runtime_api_failure_exits_with_code_1() {
+    // A closed port: `/next` fails, so the loop stops.
+    let closed = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        l.local_addr().expect("addr")
+    };
+    let mut app = spawn_app(Some(closed), free_port(), "buffered");
+    let status = tokio::task::spawn_blocking(move || app.wait_exit(WAIT))
+        .await
+        .expect("join")
+        .expect("exit in time");
+    assert_eq!(status.code(), Some(1), "{status}");
 }
 
 #[tokio::test]

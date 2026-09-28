@@ -313,3 +313,46 @@ fn missing_env_error_names_the_variables() {
         "Lambda environment is not complete; missing or invalid: AWS_LAMBDA_RUNTIME_API, AWS_LAMBDA_FUNCTION_NAME"
     );
 }
+
+// ---- Errors ------------------------------------------------------------------
+
+#[test]
+fn errors_have_clear_messages() {
+    assert!(
+        PluginError::ZeroPort
+            .to_string()
+            .contains("server.port is 0")
+    );
+    assert!(
+        PluginError::TlsUnsupported
+            .to_string()
+            .contains("server.tls")
+    );
+    assert!(
+        PluginError::UnixSocketUnsupported
+            .to_string()
+            .contains("server.unix_socket")
+    );
+    let io = std::io::Error::other("no threads");
+    assert!(
+        PluginError::Runtime(io)
+            .to_string()
+            .contains("cannot start the Lambda runtime thread: no threads")
+    );
+}
+
+#[test]
+fn runtime_errors_compare_by_kind() {
+    let a = PluginError::Runtime(std::io::Error::other("a"));
+    let b = PluginError::Runtime(std::io::Error::other("b"));
+    let c = PluginError::Runtime(std::io::ErrorKind::OutOfMemory.into());
+    assert_eq!(a, b);
+    assert_ne!(a, c);
+    assert_ne!(a, PluginError::ZeroPort);
+}
+
+#[test]
+fn errors_convert_to_autumn_errors() {
+    let err: autumn_web::AutumnError = PluginError::ZeroPort.into();
+    assert!(err.to_string().contains("server.port is 0"));
+}
