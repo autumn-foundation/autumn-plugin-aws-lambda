@@ -34,9 +34,9 @@ mod runtime;
 mod timing;
 mod upstream;
 
-pub use activation::{Activation, RUNTIME_API_ENV};
+pub use activation::{Activation, RUNTIME_API_ENV, missing_lambda_env};
 pub use error::PluginError;
-pub use headers::{strip_hop_by_hop, prepare_request_headers, REQUEST_ID_HEADER};
+pub use headers::{REQUEST_ID_HEADER, prepare_request_headers, strip_hop_by_hop};
 pub use plugin::AwsLambdaPlugin;
 pub use proxy::{LambdaProxy, ProxyBody, ProxyFailure};
 pub use runtime::{ResponseMode, wait_until};

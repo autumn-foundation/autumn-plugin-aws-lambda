@@ -71,7 +71,13 @@ async fn error(
     record(&fake, id, "error", headers, body).await
 }
 
-async fn record(fake: &Fake, request_id: String, kind: &'static str, headers: HeaderMap, body: Bytes) -> StatusCode {
+async fn record(
+    fake: &Fake,
+    request_id: String,
+    kind: &'static str,
+    headers: HeaderMap,
+    body: Bytes,
+) -> StatusCode {
     let _ = fake
         .posted
         .send(Posted {
@@ -84,7 +90,11 @@ async fn record(fake: &Fake, request_id: String, kind: &'static str, headers: He
     StatusCode::ACCEPTED
 }
 
-async fn spawn_fake() -> (SocketAddr, mpsc::Sender<(String, String)>, mpsc::Receiver<Posted>) {
+async fn spawn_fake() -> (
+    SocketAddr,
+    mpsc::Sender<(String, String)>,
+    mpsc::Receiver<Posted>,
+) {
     let (event_tx, event_rx) = mpsc::channel(8);
     let (posted_tx, posted_rx) = mpsc::channel(8);
     let fake = Fake {
@@ -93,10 +103,15 @@ async fn spawn_fake() -> (SocketAddr, mpsc::Sender<(String, String)>, mpsc::Rece
     };
     let app = Router::new()
         .route("/2018-06-01/runtime/invocation/next", get(next))
-        .route("/2018-06-01/runtime/invocation/{id}/response", post(response))
+        .route(
+            "/2018-06-01/runtime/invocation/{id}/response",
+            post(response),
+        )
         .route("/2018-06-01/runtime/invocation/{id}/error", post(error))
         .with_state(fake);
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
     let addr = listener.local_addr().expect("addr");
     tokio::spawn(async move { axum::serve(listener, app).await });
     (addr, event_tx, posted_rx)
@@ -136,9 +151,22 @@ impl Drop for App {
     }
 }
 
+/// Autumn checks the `Host` header. Lambda URLs must be trusted.
+const TRUSTED_HOSTS: &str = "localhost,.lambda-url.us-east-1.on.aws";
+
 fn spawn_app(runtime_api: Option<SocketAddr>, port: u16, mode: &str) -> App {
+    spawn_app_with_hosts(runtime_api, port, mode, TRUSTED_HOSTS)
+}
+
+fn spawn_app_with_hosts(
+    runtime_api: Option<SocketAddr>,
+    port: u16,
+    mode: &str,
+    hosts: &str,
+) -> App {
     let mut cmd = Command::new(example_binary());
     cmd.env("AUTUMN_SERVER__PORT", port.to_string())
+        .env("AUTUMN_SECURITY__TRUSTED_HOSTS__HOSTS", hosts)
         .env("LAMBDA_RESPONSE_MODE", mode)
         .env("AWS_LAMBDA_FUNCTION_NAME", "hello")
         .env("AWS_LAMBDA_FUNCTION_MEMORY_SIZE", "128")
@@ -189,7 +217,10 @@ async fn invoke(
     id: &str,
     path: &str,
 ) -> Posted {
-    events.send((id.to_owned(), event(path))).await.expect("send event");
+    events
+        .send((id.to_owned(), event(path)))
+        .await
+        .expect("send event");
     let got = tokio::time::timeout(WAIT, posted.recv())
         .await
         .expect("response in time")
@@ -210,7 +241,7 @@ async fn buffered_invocations_reach_the_app() {
     let got = invoke(&events, &mut posted, "e2e-1", "/hello").await;
     assert_eq!(got.kind, "response");
     let v = json_body(&got);
-    assert_eq!(v["statusCode"], 200);
+    assert_eq!(v["statusCode"], 200, "{v}");
     assert_eq!(v["body"], "hello from autumn (request e2e-1)");
 
     // A second event uses the same loop and connection pool.
@@ -240,6 +271,22 @@ async fn streaming_invocation_reaches_the_app() {
         serde_json::from_slice(&got.body[..split]).expect("prelude json");
     assert_eq!(prelude["statusCode"], 200);
     assert_eq!(&got.body[split + 8..], b"hello from autumn (request e2e-s)");
+}
+
+#[tokio::test]
+async fn untrusted_host_is_a_400_response_not_an_invocation_error() {
+    let (api, events, mut posted) = spawn_fake().await;
+    let _app = spawn_app_with_hosts(Some(api), free_port(), "buffered", "localhost");
+
+    let got = invoke(&events, &mut posted, "e2e-h", "/hello").await;
+    assert_eq!(got.kind, "response");
+    let v = json_body(&got);
+    assert_eq!(v["statusCode"], 400, "{v}");
+    assert!(
+        v["body"]
+            .as_str()
+            .is_some_and(|b| b.contains("Invalid Host header"))
+    );
 }
 
 #[tokio::test]

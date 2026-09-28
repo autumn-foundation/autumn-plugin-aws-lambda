@@ -103,12 +103,13 @@ pub fn next_delay_ms(current: u64, max: u64) -> (r: u64)
 }
 
 /// Model of the readiness wait loop in `src/runtime.rs::wait_until`.
-/// It returns the number of probes.
+/// It returns the number of probes. The last sleep stops at `timeout`.
 /// Proof: the loop ends, and the probe count has a fixed bound.
 pub fn readiness_probes(timeout: u64, initial: u64, max: u64) -> (probes: u64)
     requires
         0 < initial <= max,
-        timeout <= u64::MAX - max,
+        // The probe counter exists only in this model. This keeps it in range.
+        timeout < u64::MAX - 1,
     ensures
         probes >= 1,
         probes as int <= timeout as int / initial as int + 2,
@@ -119,39 +120,48 @@ pub fn readiness_probes(timeout: u64, initial: u64, max: u64) -> (probes: u64)
     while slept < timeout
         invariant
             0 < initial <= delay <= max,
-            timeout <= u64::MAX - max,
-            slept <= timeout + max,
+            timeout < u64::MAX - 1,
+            slept <= timeout,
             probes >= 1,
-            (probes as int - 1) * initial as int <= slept as int,
+            slept < timeout ==> (probes as int - 1) * initial as int <= slept as int,
             probes as int <= timeout as int / initial as int + 2,
-        decreases timeout + max - slept,
+        decreases timeout - slept,
     {
         let ghost old_slept = slept as int;
         let ghost old_probes = probes as int;
-        let ghost d = delay as int;
         let ghost t = timeout as int;
         let ghost init = initial as int;
         proof {
-            // Before this probe, (old_probes - 1) probes each slept at least `initial`.
-            assert((old_probes - 1) * init < t);
+            // Each earlier probe slept at least `initial`, and `slept < timeout`.
             assert(old_probes - 1 <= t / init) by (nonlinear_arith)
                 requires
-                    (old_probes - 1) * init < t,
+                    (old_probes - 1) * init <= old_slept,
+                    old_slept < t,
                     init > 0,
                     old_probes >= 1,
             ;
+            assert(t / init <= t) by (nonlinear_arith)
+                requires
+                    t >= 0,
+                    init > 0,
+            ;
+            assert(old_probes < u64::MAX);
         }
-        slept = slept + delay;
+        let step = if delay < timeout - slept { delay } else { timeout - slept };
+        slept = slept + step;
         delay = next_delay_ms(delay, max);
         probes = probes + 1;
         proof {
-            assert((probes as int - 1) * init <= slept as int) by (nonlinear_arith)
-                requires
-                    (old_probes - 1) * init <= old_slept,
-                    d >= init,
-                    probes as int == old_probes + 1,
-                    slept as int == old_slept + d,
-            ;
+            if slept < timeout {
+                // Not the last sleep, so the step was the full delay.
+                assert((probes as int - 1) * init <= slept as int) by (nonlinear_arith)
+                    requires
+                        (old_probes - 1) * init <= old_slept,
+                        step as int >= init,
+                        probes as int == old_probes + 1,
+                        slept as int == old_slept + step as int,
+                ;
+            }
         }
     }
     probes

@@ -51,12 +51,12 @@ async fn spawn_upstream() -> SocketAddr {
             "/cookies",
             get(|| async {
                 (
-                    [
+                    axum::response::AppendHeaders([
                         ("set-cookie", "a=1"),
                         ("set-cookie", "b=2"),
                         ("connection", "x-internal"),
                         ("x-internal", "secret"),
-                    ],
+                    ]),
                     "ok",
                 )
             }),
@@ -115,13 +115,18 @@ fn now_ms() -> u64 {
 
 fn ctx(request_id: &str, deadline_in: Duration) -> Context {
     let mut ctx = Context::default();
-    ctx.request_id = request_id.to_owned();
+    request_id.clone_into(&mut ctx.request_id);
     ctx.deadline = now_ms() + u64::try_from(deadline_in.as_millis()).expect("fits u64");
     ctx
 }
 
 /// Parses an API Gateway HTTP API (v2) event into a Lambda request.
-fn apigw_v2(method: &str, path: &str, query: &str, body: Option<(&str, bool)>) -> lambda_http::Request {
+fn apigw_v2(
+    method: &str,
+    path: &str,
+    query: &str,
+    body: Option<(&str, bool)>,
+) -> lambda_http::Request {
     let (body, b64) = body.unwrap_or(("", false));
     let event = serde_json::json!({
         "version": "2.0",
@@ -159,7 +164,10 @@ fn apigw_v2(method: &str, path: &str, query: &str, body: Option<(&str, bool)>) -
     lambda_http::request::from_str(&event.to_string()).expect("valid event")
 }
 
-async fn call(proxy: &mut LambdaProxy, req: lambda_http::Request) -> (StatusCode, HeaderMap, Bytes) {
+async fn call(
+    proxy: &mut LambdaProxy,
+    req: lambda_http::Request,
+) -> (StatusCode, HeaderMap, Bytes) {
     let resp: http::Response<ProxyBody> = proxy.call(req).await.expect("infallible");
     let (parts, body) = resp.into_parts();
     let bytes = body.collect().await.expect("body").to_bytes();
@@ -173,7 +181,11 @@ fn proxy(addr: SocketAddr) -> LambdaProxy {
 #[tokio::test]
 async fn get_with_query_reaches_upstream() {
     let addr = spawn_upstream().await;
-    let (status, _, body) = call(&mut proxy(addr), apigw_v2("GET", "/query", "a=1&b=two", None)).await;
+    let (status, _, body) = call(
+        &mut proxy(addr),
+        apigw_v2("GET", "/query", "a=1&b=two", None),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body, "/query?a=1&b=two");
 }
@@ -207,7 +219,8 @@ async fn base64_binary_body_round_trips() {
 #[tokio::test]
 async fn request_headers_are_prepared() {
     let addr = spawn_upstream().await;
-    let req = apigw_v2("GET", "/headers", "", None).with_lambda_context(ctx("lambda-req-7", Duration::from_secs(30)));
+    let req = apigw_v2("GET", "/headers", "", None)
+        .with_lambda_context(ctx("lambda-req-7", Duration::from_secs(30)));
     let (_, _, body) = call(&mut proxy(addr), req).await;
     assert_eq!(
         body,
@@ -250,7 +263,8 @@ async fn closed_upstream_gives_502() {
 #[tokio::test]
 async fn slow_upstream_past_deadline_gives_504() {
     let addr = spawn_upstream().await;
-    let req = apigw_v2("GET", "/slow", "", None).with_lambda_context(ctx("r", Duration::from_millis(300)));
+    let req = apigw_v2("GET", "/slow", "", None)
+        .with_lambda_context(ctx("r", Duration::from_millis(300)));
     let mut p = proxy(addr).timeout_margin(Duration::from_millis(50));
     let started = std::time::Instant::now();
     let (status, _, body) = call(&mut p, req).await;
@@ -262,7 +276,8 @@ async fn slow_upstream_past_deadline_gives_504() {
 #[tokio::test]
 async fn slow_body_past_deadline_gives_504_when_buffered() {
     let addr = spawn_upstream().await;
-    let req = apigw_v2("GET", "/slow-body", "", None).with_lambda_context(ctx("r", Duration::from_millis(300)));
+    let req = apigw_v2("GET", "/slow-body", "", None)
+        .with_lambda_context(ctx("r", Duration::from_millis(300)));
     let (status, _, _) = call(&mut proxy(addr), req).await;
     assert_eq!(status, StatusCode::GATEWAY_TIMEOUT);
 }
@@ -270,7 +285,8 @@ async fn slow_body_past_deadline_gives_504_when_buffered() {
 #[tokio::test]
 async fn streaming_returns_head_then_streams_body() {
     let addr = spawn_upstream().await;
-    let req = apigw_v2("GET", "/slow-body", "", None).with_lambda_context(ctx("r", Duration::from_secs(30)));
+    let req = apigw_v2("GET", "/slow-body", "", None)
+        .with_lambda_context(ctx("r", Duration::from_secs(30)));
     let mut p = proxy(addr).buffer_body(false);
     let resp = tokio::time::timeout(Duration::from_secs(2), p.call(req))
         .await

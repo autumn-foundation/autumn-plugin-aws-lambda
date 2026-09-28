@@ -257,3 +257,59 @@ fn server_config_rejects_tls() {
         Err(PluginError::TlsUnsupported)
     );
 }
+
+#[test]
+fn server_config_rejects_zero_port() {
+    assert_eq!(
+        Upstream::from_server_config(&server("127.0.0.1", 0)),
+        Err(PluginError::ZeroPort)
+    );
+}
+
+// ---- Lambda environment ----------------------------------------------------
+
+#[test]
+fn missing_env_lists_required_lambda_variables() {
+    let none = |_: &str| None;
+    assert_eq!(
+        autumn_plugin_aws_lambda::missing_lambda_env(none),
+        [
+            "AWS_LAMBDA_RUNTIME_API",
+            "AWS_LAMBDA_FUNCTION_NAME",
+            "AWS_LAMBDA_FUNCTION_MEMORY_SIZE",
+            "AWS_LAMBDA_FUNCTION_VERSION",
+        ]
+    );
+}
+
+#[test]
+fn missing_env_is_empty_on_lambda() {
+    let all = |_: &str| Some("128".to_owned());
+    assert!(autumn_plugin_aws_lambda::missing_lambda_env(all).is_empty());
+}
+
+#[test]
+fn missing_env_rejects_bad_memory_size() {
+    let env = |name: &str| {
+        Some(if name == "AWS_LAMBDA_FUNCTION_MEMORY_SIZE" {
+            "lots".to_owned()
+        } else {
+            "x".to_owned()
+        })
+    };
+    assert_eq!(
+        autumn_plugin_aws_lambda::missing_lambda_env(env),
+        ["AWS_LAMBDA_FUNCTION_MEMORY_SIZE"]
+    );
+}
+
+#[test]
+fn missing_env_error_names_the_variables() {
+    let err = PluginError::MissingEnv {
+        names: vec!["AWS_LAMBDA_RUNTIME_API", "AWS_LAMBDA_FUNCTION_NAME"],
+    };
+    assert_eq!(
+        err.to_string(),
+        "Lambda environment is not complete; missing or invalid: AWS_LAMBDA_RUNTIME_API, AWS_LAMBDA_FUNCTION_NAME"
+    );
+}
