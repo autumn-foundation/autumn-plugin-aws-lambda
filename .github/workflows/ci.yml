@@ -1,0 +1,68 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: fmt, clippy, test, coverage
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy, llvm-tools-preview
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@cargo-llvm-cov
+      - name: Format
+        run: cargo fmt --all -- --check
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Docs
+        run: cargo doc --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings
+      - name: Test and coverage (minimum 85% lines)
+        run: cargo llvm-cov --fail-under-lines 85 --summary-only
+
+  msrv:
+    name: MSRV (1.88)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88.0
+      - uses: Swatinem/rust-cache@v2
+      - name: Check
+        run: cargo check --all-targets
+
+  verus:
+    name: Verus proofs
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download Verus
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download --repo verus-lang/verus --pattern '*x86-linux.zip' --dir "$RUNNER_TEMP"
+          unzip -q "$RUNNER_TEMP"/*x86-linux.zip -d "$RUNNER_TEMP/verus"
+          VERUS="$(find "$RUNNER_TEMP/verus" -type f -name verus -perm -u+x | head -n1)"
+          echo "VERUS=$VERUS" >> "$GITHUB_ENV"
+      - name: Install the Verus toolchain
+        run: |
+          # Verus prints the toolchain it needs. Remove color codes first.
+          out="$("$VERUS" --version 2>&1 || true)"
+          toolchain="$(printf '%s\n' "$out" | sed 's/\x1b\[[0-9;]*m//g' | tr -d '\r' \
+            | grep -oE 'rustup install [0-9]+\.[0-9]+\.[0-9]+-[A-Za-z0-9_-]+' | head -n1 | awk '{print $3}' || true)"
+          if [ -n "$toolchain" ]; then rustup install --profile minimal "$toolchain"; fi
+          "$VERUS" --version
+      - name: Verify
+        run: verification/verify.sh
