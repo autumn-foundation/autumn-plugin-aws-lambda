@@ -5,7 +5,7 @@ brainstorming, reverse brainstorming, and six thinking hats.
 
 ## Goal
 
-Run an Autumn (`autumn-web` 0.7) application on AWS Lambda.
+Run an Autumn (`autumn-web` 0.8) application on AWS Lambda.
 Add one line to the app: `.plugin(AwsLambdaPlugin::new())`.
 The same binary must also run as a normal server outside Lambda.
 
