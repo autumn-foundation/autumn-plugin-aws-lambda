@@ -425,7 +425,7 @@ fn missing_env_lists_required_lambda_variables() {
 #[test]
 fn missing_env_is_empty_on_lambda() {
     let all = |_: &str| Some("128".to_owned());
-    assert!(missing_lambda_env(all).is_empty());
+    assert_eq!(missing_lambda_env(all), Vec::<&str>::new());
 }
 
 #[test]
@@ -492,7 +492,7 @@ fn shutdown_timing_warning_names_slow_settings() {
         shutdown_timeout_secs: 1,
         ..ServerConfig::default()
     };
-    assert!(slow_shutdown_settings(&fast).is_empty());
+    assert_eq!(slow_shutdown_settings(&fast), Vec::<&str>::new());
     assert_eq!(
         slow_shutdown_settings(&ServerConfig::default()),
         ["server.prestop_grace_secs", "server.shutdown_timeout_secs"]
