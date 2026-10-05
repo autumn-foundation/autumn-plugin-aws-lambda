@@ -12,7 +12,7 @@ categories = ["web-programming::http-server"]
 exclude = ["verification/", ".github/", ".githooks/", "CLAUDE.md", ".gitignore"]
 
 [dependencies]
-autumn-web = { version = "0.7", default-features = false }
+autumn-web = { version = "0.8", default-features = false }
 bytes = "1"
 http = "1"
 http-body-util = "0.1"

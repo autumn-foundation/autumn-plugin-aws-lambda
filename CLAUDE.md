@@ -4,7 +4,7 @@ Guide for agents that work in this repository.
 
 ## What this is
 
-`autumn-plugin-aws-lambda`: an Autumn (`autumn-web` 0.7) plugin that runs
+`autumn-plugin-aws-lambda`: an Autumn (`autumn-web` 0.8) plugin that runs
 an Autumn app on AWS Lambda. Design: loopback proxy
 (`docs/adr/0001-loopback-proxy.md`). Planning: `docs/planning.md`.
 
