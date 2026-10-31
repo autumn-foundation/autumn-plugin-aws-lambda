@@ -1,6 +1,6 @@
 # autumn-plugin-aws-lambda
 
-Run an [Autumn](https://autumn-web.app) (`autumn-web` 0.8) application on
+Run an [Autumn](https://autumn-web.app) (`autumn-web` 0.9) application on
 AWS Lambda. Add one line. The same binary also runs as a normal server.
 
 ```rust
