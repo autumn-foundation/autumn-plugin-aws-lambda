@@ -44,7 +44,7 @@ See [ADR 0001](docs/adr/0001-loopback-proxy.md) for the reasons.
 
 ```toml
 [dependencies]
-autumn-plugin-aws-lambda = "0.1"
+autumn-plugin-aws-lambda = "0.2"
 ```
 
 ## Options
