@@ -22,9 +22,11 @@ async fn main() {
         Ok("streaming") => ResponseMode::Streaming,
         _ => ResponseMode::Buffered,
     };
-    autumn_web::app()
-        .plugin(AwsLambdaPlugin::new().response_mode(mode))
-        .routes(routes![hello])
-        .run()
-        .await;
+    Box::pin(
+        autumn_web::app()
+            .plugin(AwsLambdaPlugin::new().response_mode(mode))
+            .routes(routes![hello])
+            .run(),
+    )
+    .await;
 }
