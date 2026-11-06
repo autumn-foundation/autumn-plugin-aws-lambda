@@ -1,8 +1,8 @@
 [package]
 name = "autumn-plugin-aws-lambda"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
-rust-version = "1.88.0"
+rust-version = "1.97.0"
 license = "Apache-2.0"
 description = "Run an autumn-web application on AWS Lambda"
 repository = "https://github.com/autumn-foundation/autumn-plugin-aws-lambda"
@@ -12,7 +12,7 @@ categories = ["web-programming::http-server"]
 exclude = ["verification/", ".github/", ".githooks/", "CLAUDE.md", ".gitignore"]
 
 [dependencies]
-autumn-web = { version = "0.9", default-features = false }
+autumn-web = { version = "0.10", default-features = false }
 bytes = "1"
 http = "1"
 http-body-util = "0.1"
