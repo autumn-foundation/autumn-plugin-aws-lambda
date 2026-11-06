@@ -1,6 +1,6 @@
 # autumn-plugin-aws-lambda
 
-Run an [Autumn](https://autumn-web.app) (`autumn-web` 0.9) application on
+Run an [Autumn](https://autumn-web.app) (`autumn-web` 0.10) application on
 AWS Lambda. Add one line. The same binary also runs as a normal server.
 
 ```rust
@@ -44,7 +44,7 @@ See [ADR 0001](docs/adr/0001-loopback-proxy.md) for the reasons.
 
 ```toml
 [dependencies]
-autumn-plugin-aws-lambda = "0.2"
+autumn-plugin-aws-lambda = "0.3"
 ```
 
 ## Options
