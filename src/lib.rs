@@ -57,3 +57,8 @@ pub mod __private {
     pub use crate::timing::{invoke_budget_ms, next_delay_ms};
     pub use crate::upstream::Upstream;
 }
+
+/// Compiles the Rust snippets of the README as doctests.
+#[cfg(doctest)]
+#[doc = include_str!("../README.md")]
+pub struct ReadmeDoctests;
