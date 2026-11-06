@@ -28,6 +28,8 @@ an Autumn app on AWS Lambda. Design: loopback proxy
 
 ## Rules
 
+- README Rust snippets are doctests. Make them compile; use `no_run`, not `ignore`.
+  `tests/doc_snippets.rs` checks the TOML snippets and the version pins in the docs.
 - Process: SPEC, PROOF, RED, GREEN, REFACTOR. Write a test for each behavior.
 - To change a pure function that has a Verus twin:
   1. Change the twin in `verification/core.rs`.

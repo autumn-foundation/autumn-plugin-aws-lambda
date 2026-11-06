@@ -32,6 +32,8 @@ jobs:
           RUSTDOCFLAGS: -D warnings
       - name: Test and coverage (minimum 85% lines)
         run: cargo llvm-cov --fail-under-lines 85 --summary-only
+      - name: README and API doc examples
+        run: cargo test --locked --doc
 
   msrv:
     name: MSRV (1.97)

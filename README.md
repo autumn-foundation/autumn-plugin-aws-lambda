@@ -3,7 +3,7 @@
 Run an [Autumn](https://autumn-web.app) (`autumn-web` 0.10) application on
 AWS Lambda. Add one line. The same binary also runs as a normal server.
 
-```rust
+```rust,no_run
 use autumn_plugin_aws_lambda::AwsLambdaPlugin;
 use autumn_web::prelude::*;
 
