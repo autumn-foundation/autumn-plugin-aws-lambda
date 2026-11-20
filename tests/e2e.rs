@@ -118,16 +118,35 @@ async fn spawn_fake() -> (
 }
 
 /// Returns `(target dir, profile dir)` of this test binary.
+///
+/// Cargo puts a test binary in `<target>/<profile>/deps/` or, with the
+/// newer build layout, in `<target>/<profile>/build/<pkg>/<hash>/out/`.
+/// The profile dir is the nearest parent named `debug` or `release`.
 fn dirs() -> (PathBuf, PathBuf) {
-    // current_exe: <target>/<profile>/deps/e2e-<hash>
     let exe = std::env::current_exe().expect("exe");
-    let profile_dir = exe
-        .parent()
-        .and_then(|p| p.parent())
-        .expect("profile dir")
-        .to_path_buf();
+    let profile_dir = profile_dir_of(&exe).expect("profile dir");
     let target_dir = profile_dir.parent().expect("target dir").to_path_buf();
     (target_dir, profile_dir)
+}
+
+/// Returns the nearest parent of `exe` named `debug` or `release`.
+fn profile_dir_of(exe: &FsPath) -> Option<PathBuf> {
+    exe.ancestors()
+        .skip(1)
+        .find(|p| {
+            p.file_name()
+                .is_some_and(|n| n == "debug" || n == "release")
+        })
+        .map(FsPath::to_path_buf)
+}
+
+#[test]
+fn profile_dir_is_found_in_both_build_layouts() {
+    let old = FsPath::new("/t/debug/deps/e2e-1");
+    let new = FsPath::new("/t/release/build/pkg/abc/out/e2e-1");
+    assert_eq!(profile_dir_of(old), Some(PathBuf::from("/t/debug")));
+    assert_eq!(profile_dir_of(new), Some(PathBuf::from("/t/release")));
+    assert_eq!(profile_dir_of(FsPath::new("/t/x/e2e-1")), None);
 }
 
 /// Builds the example one time, with the profile of this test binary.
@@ -136,17 +155,29 @@ fn example_binary() -> &'static FsPath {
     BINARY.get_or_init(|| {
         let (target_dir, profile_dir) = dirs();
         let mut cmd = Command::new(env!("CARGO"));
-        cmd.args(["build", "--quiet", "--example", "hello", "--target-dir"])
-            .arg(&target_dir)
-            .current_dir(env!("CARGO_MANIFEST_DIR"));
+        cmd.args([
+            "build",
+            "--quiet",
+            "--message-format=json-render-diagnostics",
+            "--example",
+            "hello",
+            "--target-dir",
+        ])
+        .arg(&target_dir)
+        .current_dir(env!("CARGO_MANIFEST_DIR"));
         if profile_dir.file_name().is_some_and(|n| n == "release") {
             cmd.arg("--release");
         }
-        assert!(
-            cmd.status().expect("cargo build").success(),
-            "example build failed"
-        );
-        profile_dir.join("examples").join("hello")
+        cmd.stderr(Stdio::inherit());
+        let out = cmd.output().expect("cargo build");
+        assert!(out.status.success(), "example build failed");
+        // Read the path from cargo. Do not guess it from the layout.
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .filter(|m| m["reason"] == "compiler-artifact" && m["target"]["name"] == "hello")
+            .find_map(|m| m["executable"].as_str().map(PathBuf::from))
+            .expect("cargo reports the example executable")
     })
 }
 
