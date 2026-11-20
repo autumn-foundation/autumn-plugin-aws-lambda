@@ -15,7 +15,7 @@ use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use tokio::sync::{Mutex, mpsc};
 
-const WAIT: Duration = Duration::from_secs(60);
+const WAIT: Duration = Duration::from_mins(1);
 
 /// One result that the runtime loop posted.
 #[derive(Debug)]
